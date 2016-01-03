@@ -1,0 +1,810 @@
+#!/bin/bash
+
+##############################################################
+# title		: archinstaller
+# description	: Automated installation script for arch linux
+# authors	: Dennis Anfossi,
+#		  Lukas B.
+# contact	: https://github.com/vitamins/archinstaller
+# date		: 10.05.2014
+# version	: 0.7.8.7
+# license	: GPLv2
+# usage		: Edit ari.conf and run ./archinstaller
+##############################################################
+
+declare -r VERSION='0.7.8.8'
+
+# colors
+unset ALL_OFF GREEN RED
+ALL_OFF='\e[1;0m'
+GREEN='\e[1;32m'
+RED='\e[1;31m'
+readonly ALL_OFF GREEN RED
+
+# functions
+# {{{
+config_fail() {
+printf "$RED"
+printf '%s\n' "| Error in variable ${1}."
+printf "$ALL_OFF"
+exit 1
+}
+
+fail() {
+printf "$RED"
+printf '%s\n' "| Error, ${1}."
+printf "$ALL_OFF"
+exit 1
+}
+
+# wait 2 seconds for the user to read the message, if confirm is set to yes
+message() {
+printf "${RED}\n"
+printf '%s\n' '| archinstaller:'
+printf '%s\n' "| ${1}"
+printf "${ALL_OFF}\n"
+[[ "$confirm" = 'yes' ]] && sleep 2
+return 0
+}
+
+check_conf() {
+printf "$RED"
+printf '%s\n' '| Checking configuration..'
+printf "$ALL_OFF"
+# confirm
+[[ "$confirm" = 'yes' || "$confirm" = 'no' ]] || config_fail 'confirm'
+# edit_conf
+if [[ "$edit_conf" = 'yes' ]]; then
+	type "$EDITOR" > /dev/null || config_fail 'EDITOR'
+else
+	[[ "$edit_conf" = 'no' ]] || config_fail 'edit_conf'
+fi
+# unmount
+[[ "$unmount" = 'yes' || "$unmount" = 'no' ]] || config_fail 'unmount'
+# manual_part
+if [[ "$manual_part" = 'yes' ]]; then
+	mountpoint -q /mnt || fail 'no mounted filesystem found at target /mnt'
+	[[ -z "$cmdline" ]] && config_fail 'cmdline'
+	if [[ "$bootloader" = 'grub' && "$uefi" = 'no' ]]; then
+		# dest_disk
+		[[ -z "$dest_disk" ]] && config_fail 'dest_disk'
+		## check if dest_disk is really a disk
+		[[ $(lsblk -dno TYPE "$dest_disk") = 'disk' ]] || config_fail 'dest_disk'
+	fi
+else
+	[[ "$manual_part" = 'no' ]] || config_fail 'manual_part'
+	# dest_disk
+	[[ -z "$dest_disk" ]] && config_fail 'dest_disk'
+	## check if dest_disk is really a disk
+	[[ $(lsblk -dno TYPE "$dest_disk") = 'disk' ]] || config_fail 'dest_disk'
+	# check /mnt for availability
+	mountpoint -q /mnt && fail 'working directory /mnt is blocked by mounted filesystem'
+	# check dest_disk for mounted filesystems
+	mount | grep "$dest_disk" > /dev/null &&
+	 fail 'found mounted filesystem on destination disk'
+	# swap
+	if [[ "$swap" = 'yes' ]]; then
+		## swap_size
+		[[ -z "$swap_size" ]] && config_fail 'swap_size'
+		[[ "$swap_size" =~ ^[0-9]+[K,M,G,T]$ ]] || config_fail 'swap_size'
+	else
+		[[ "$swap" = 'no' ]] || config_fail 'swap'
+	fi
+	# root_size
+	if [[ "$root_size" = '0' ]]; then
+		[[ "$home" = 'no' ]] || config_fail 'home'
+	else
+		[[ -z "$root_size" ]] && config_fail 'root_size'
+		[[ "$root_size" =~ ^[0-9]+[K,M,G,T]$ ]] || config_fail 'root_size'
+	fi
+	# home
+	if [[ "$home" = 'yes' ]]; then
+		## home_size
+		if [[ "$home_size" != '0' ]]; then
+			[[ -z "$home_size" ]] && config_fail 'home_size'
+			[[ "$home_size" =~ ^[0-9]+[K,M,G,T]$ ]] || config_fail 'home_size'
+		fi
+		## encrypt_home
+		if [[ "$encrypt_home" = 'yes' ]]; then
+			[[ -z "$cryptsetup_options" ]] && config_fail 'cryptsetup_options'
+		else
+			[[ "$encrypt_home" = 'no' ]] || config_fail 'encrypt_home'
+		fi
+	else
+		[[ "$home" = 'no' ]] || config_fail 'home'
+	fi
+	# fstype
+	## check if mkfs utilities are installed
+	## set options for overwriting existing filesystems
+	case "$fstype" in
+		btrfs)	type mkfs.btrfs > /dev/null || fail 'missing package: btrfs-progs'
+			packages+=( 'btrfs-progs' )
+			mkfs_options="$fstype";;
+		ext2|ext3|ext4)
+			type mkfs.ext4 > /dev/null || fail 'missing package: e2fsprogs'
+			mkfs_options="${fstype} -q";;
+		f2fs)	type mkfs.f2fs > /dev/null || fail 'missing package: f2fs-tools'
+			packages+=( 'f2fs-tools' )
+			mkfs_options="$fstype";;
+		jfs)	type mkfs.jfs > /dev/null || fail 'missing package: jfsutils'
+			mkfs_options="${fstype} -q";;
+		nilfs2)	type mkfs.nilfs2 > /dev/null || fail 'missing package: nilfs-utils'
+			packages+=( 'nilfs-utils' )
+			mkfs_options="${fstype} -f -q";;
+		reiserfs)
+			type mkfs.reiserfs > /dev/null || fail 'missing package: reiserfsprogs'
+			mkfs_options="${fstype} -q";;
+		xfs)	type mkfs.xfs > /dev/null || fail 'missing package: xfsprogs'
+			mkfs_options="${fstype} -f -q";;
+		*)	config_fail 'fstype';;
+	esac
+fi
+# uefi
+if [[ "$uefi" = 'yes' ]]; then
+	## check if install host is booted in uefi mode
+	if [[ -z "$(mount -t efivarfs)" ]]; then
+		mount -t efivarfs efivarfs /sys/firmware/efi/efivars > /dev/null ||
+		 config_fail 'uefi'
+	fi
+	efivar -l > /dev/null || config_fail 'uefi'
+	## bootloader
+	[[ "$bootloader" = 'grub' || "$bootloader" = 'gummiboot' ]] || config_fail 'bootloader'
+	if [[ "$manual_part" = 'no' ]]; then
+		type mkfs.vfat > /dev/null || fail 'missing package: dosfstools'
+	fi
+	[[ -z "$esp_size" ]] && config_fail 'esp_size'
+	[[ "$esp_size" =~ ^[0-9]+[K,M,G,T]$ ]] || config_fail 'esp_size'
+else
+	[[ "$uefi" = 'no' ]] || config_fail 'uefi'
+	## bootloader
+	[[ "$bootloader" = 'syslinux' || "$bootloader" = 'grub' ]] || config_fail 'bootloader'
+	# boot_size
+	[[ -z "$boot_size" ]] && config_fail 'boot_size'
+	[[ "$boot_size" =~ ^[0-9]+[K,M,G,T]$ ]] || config_fail 'boot_size'
+fi
+# mirror
+## online status is checked after internet connection was tested successfully
+[[ -z "$mirror" ]] && config_fail 'mirror'
+[[ "$mirror" =~ /$ ]] || config_fail 'mirror'
+# locale
+[[ -z "$locale" ]] && config_fail 'locale'
+## enforce UTF-8
+[[ "$locale" =~ ^[a-z]{2,3}_[A-Z]{2}(.UTF-8)?\ UTF-8$ ]] || config_fail 'locale'
+# keymap
+[[ -z "$keymap" ]] && config_fail 'keymap'
+localectl --no-pager list-keymaps | grep -x "$keymap" > /dev/null || config_fail 'keymap'
+# font
+[[ -z "$font" ]] && config_fail 'font'
+# timezone
+[[ -z "$timezone" ]] && config_fail 'timezone'
+timedatectl --no-pager list-timezones | grep -x "$timezone" > /dev/null || config_fail 'timezone'
+# hardware_clock
+[[ "$hardware_clock" = 'utc' || "$hardware_clock" = 'localtime' ]] || config_fail 'hardware_clock'
+# hostname
+[[ -z "$hostname" ]] && config_fail 'hostname'
+[[ "$hostname" =~ ^[a-z0-9][a-z0-9-]*[a-z0-9]$ ]] || config_fail 'hostname'
+# network
+case "$network" in
+	no|dhcpcd|ifplugd)	;;
+	netctl)	[[ -z "$netctl_profile" ]] && config_fail 'netctl_profile'
+		[[ -s ./"$netctl_profile" ]] || config_fail 'netctl_profile';;
+	*)	config_fail 'network';;
+esac
+# hooks
+[[ -z "$hooks" ]] && configure_hooks='no' || configure_hooks='yes'
+# set_password
+if [[ "$set_password" = 'yes' ]]; then
+	## root password
+	[[ -z "$root_password" ]] && ask_root_password='yes' || ask_root_password='no'
+else
+	[[ "$set_password" = 'no' ]] || config_fail 'set_password'
+fi
+# add_user
+if [[ "$add_user" = 'yes' ]]; then
+	## username
+	[[ -z "$username" ]] && config_fail 'username'
+	[[ "$username" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || config_fail 'username'
+	## user password
+	if [[ "$set_password" = 'yes' ]]; then
+		[[ -z "$user_password" ]] && ask_user_password='yes' || ask_user_password='no'
+	fi
+else
+	[[ "$add_user" = 'no' ]] || config_fail 'add_user'
+fi
+
+# xorg
+if [[ "$xorg" = 'yes' ]]; then
+	## desktop_environment
+	case "$desktop_environment" in
+		no|cinnamon|enlightenment|gnome|kde|lxde|mate|xfce4)	;;
+		*)	config_fail 'desktop_environment';;
+	esac
+	### display_manager
+	case "$display_manager" in
+		no|gdm|kdm|lxdm|xdm)	;;
+		*)	config_fail 'display_manager';;
+	esac
+else
+	[[ "$xorg" = 'no' ]] || config_fail 'xorg'
+fi
+
+# no config_fail beyond this point
+printf "$GREEN"
+printf '%s\n' '| OK.'
+printf "$ALL_OFF"
+}
+
+ask_confirm() {
+printf "$RED"
+printf '%s\n' '---------------------------------------'
+if [[ "$manual_part" = 'no' ]]; then
+	printf '%s\n' 'The following drive will be formatted.'
+	lsblk -o NAME,TYPE,MODEL,SIZE,FSTYPE "$dest_disk"
+else
+	printf '%s\n' 'The following filesystems are targeted.'
+	findmnt -l -o TARGET,SOURCE -R /mnt
+fi
+printf '%s\n' '---------------------------------------'
+printf "$ALL_OFF"
+local answer='x'
+while [[ "$answer" != 'Y' ]]; do
+	printf '%s' 'Continue? (Y/n) '
+	read -n 2 -r answer
+	[[ "$answer" = 'n' ]] && fail 'script cancelled'
+	printf '\n'
+done
+}
+
+make_part() {
+# prepare disk
+message 'Preparing disk..'
+sgdisk -Z "$dest_disk"
+dd bs=1K count=1024 iflag=nocache oflag=direct if=/dev/zero of="$dest_disk"
+wipefs -a "$dest_disk"
+blockdev --rereadpt "$dest_disk"; sync; blockdev --rereadpt "$dest_disk"
+
+# partitioning
+message 'Creating partitions..'
+
+## partition layout
+if [[ "$uefi" = 'yes' ]]; then
+	# first partition is ESP
+	if [[ "$swap" = 'yes' ]]; then
+		swap_num=2
+		root_num=3
+		home_num=4
+	else
+		root_num=2
+		home_num=3
+	fi
+else
+	if [[ "$bootloader" = 'grub' ]]; then
+		# first partition is BIOS boot
+		if [[ "$swap" = 'yes' ]]; then
+			boot_num=2
+			swap_num=3
+			root_num=4
+			home_num=5
+		else
+			boot_num=2
+			root_num=3
+			home_num=4
+		fi
+	else
+		if [[ "$swap" = 'yes' ]]; then
+			boot_num=1
+			swap_num=2
+			root_num=3
+			home_num=4
+		else
+			boot_num=1
+			root_num=2
+			home_num=3
+		fi
+	fi
+fi
+
+## EFI system partition
+if [[ "$uefi" = 'yes' ]]; then
+	sgdisk -n 1:0:+"$esp_size" -t 1:EF00 "$dest_disk"
+	sleep 1
+else
+	## BIOS boot partition
+	if [[ "$bootloader" = 'grub' ]]; then
+		sgdisk -n 1:0:+1007K -t 1:EF02 "$dest_disk"
+		sleep 1
+	fi
+	## boot partition
+	sgdisk -n "$boot_num":0:+"$boot_size" -t "$boot_num":8300 "$dest_disk"
+	sleep 1
+fi
+
+## swap partition
+if [[ "$swap" = 'yes' ]]; then
+	sgdisk -n "$swap_num":0:+"$swap_size" -t "$swap_num":8200 "$dest_disk"
+	sleep 1
+fi
+
+## root partition
+sgdisk -n "$root_num":0:+"$root_size" -t "$root_num":8300 "$dest_disk"
+sleep 1
+
+## home partition
+if [[ "$home" = 'yes' ]]; then
+	sgdisk -n "$home_num":0:+"$home_size" -t "$home_num":8300 "$dest_disk"
+fi
+
+# create and mount filesystems
+## root
+message 'Formatting root..'
+mkfs.${mkfs_options} "$dest_disk""$root_num"
+message 'Mounting root..'
+mount -t "$fstype" "$dest_disk""$root_num" /mnt
+
+## ESP
+if [[ "$uefi" = 'yes' ]]; then
+	message 'Formatting ESP..'
+	mkfs.vfat -F32 "$dest_disk"1
+	mkdir -p /mnt/boot
+	message 'Mounting ESP..'
+	mount -o nodev,nosuid,noexec -t vfat "$dest_disk"1 /mnt/boot
+else
+	message 'Formatting /boot..'
+	mkfs.ext2 -q "$dest_disk""$boot_num"
+	mkdir -p /mnt/boot
+	message 'Mounting /boot..'
+	mount -o nodev,nosuid,noexec -t ext2 "$dest_disk""$boot_num" /mnt/boot
+fi
+
+## swap
+if [[ "$swap" = 'yes' ]]; then
+	message 'Formatting swap..'
+	mkswap "$dest_disk""$swap_num"
+	swapon "$dest_disk""$swap_num"
+fi
+
+## home
+if [[ "$home" = 'yes' ]]; then
+	if [[ "$encrypt_home" = 'yes' ]]; then
+		## encrypt home
+		modprobe dm_mod
+		## overwrite partition with zeroes
+		message 'Setting up Encryption. Secure erasure of partition..'
+		dd bs=4M iflag=nocache oflag=direct if=/dev/zero of="$dest_disk""$home_num" || sync
+		## map physical partition to LUKS
+		message 'Please enter a new encryption passphrase.'
+		cryptsetup ${cryptsetup_options} luksFormat "$dest_disk""$home_num"
+		## open encrypted volume
+		message 'To unlock the container, enter the passphrase again.'
+		cryptsetup open --type luks "$dest_disk""$home_num" home
+		message 'Formatting /home..'
+		mkfs.${mkfs_options} /dev/mapper/home
+		mkdir /mnt/home
+		message 'Mounting /home..'
+		mount -o nodev,nosuid -t "$fstype" /dev/mapper/home /mnt/home
+	else
+		message 'Formatting /home..'
+		mkfs.${mkfs_options} "$dest_disk""$home_num"
+		mkdir /mnt/home
+		message 'Mounting /home..'
+		mount -o nodev,nosuid -t "$fstype" "$dest_disk""$home_num" /mnt/home
+	fi
+fi
+}
+
+pacman_install() {
+pacman --noconfirm --needed -r /mnt --cachedir=/mnt/var/cache/pacman/pkg -S $@
+}
+
+install_xorg() {
+message 'Installing xorg packages..'
+pacman_install xorg-server xorg-server-utils xorg-xinit
+# install desktop environment
+case "$desktop_environment" in
+	no)	;;
+	cinnamon)
+		pacman_install cinnamon;;
+	enlightenment)
+		pacman_install enlightenment;;
+	gnome)	pacman_install gnome gnome-extra;;
+	kde)	pacman_install kde;;
+	lxde)	pacman_install lxde;;
+	mate)	pacman_install mate mate-extra;;
+	xfce4)	pacman_install xfce4 xfce4-goodies;;
+esac
+# install display manager
+case "$display_manager" in
+	no)	;;
+	gdm)	pacman_install gdm;;
+	kdm)	pacman_install kdebase-workspace;;
+	lxdm)	pacman_install lxdm;;
+	xdm)	pacman_install xorg-xdm;;
+esac
+}
+
+configure_system() {
+message 'Configuring system..'
+
+if [[ "$manual_part" = 'yes' ]]; then
+	# crypttab
+	# check if there are any encrypted containers opened before editing crypttab
+	if [[ "$edit_conf" = 'yes' && -n "$(dmsetup ls --target crypt)" ]]; then
+		"$EDITOR" /mnt/etc/crypttab
+		clear
+	fi
+	# mdadm.conf
+	if [[ -e /proc/mdstat ]] && grep '^md' /proc/mdstat > /dev/null; then
+		mdadm -Ds >> /mnt/etc/mdadm.conf
+		if [[ "$edit_conf" = 'yes' ]]; then
+			"$EDITOR" /mnt/etc/mdadm.conf
+			clear
+		fi
+	fi
+else
+	# crypttab
+	if [[ "$home" = 'yes' && "$encrypt_home" = 'yes' ]]; then
+		local home_uuid=$(lsblk -dno UUID "$dest_disk""$home_num")
+		printf '%s\n' "home UUID=${home_uuid} none luks,timeout=60s" >> /mnt/etc/crypttab
+		if [[ "$edit_conf" = 'yes' ]]; then
+			"$EDITOR" /mnt/etc/crypttab
+			clear
+		fi
+	fi
+fi
+
+# fstab
+genfstab -U -p /mnt > /mnt/etc/fstab
+if [[ "$edit_conf" = 'yes' ]]; then
+	"$EDITOR" /mnt/etc/fstab
+	clear
+fi
+# locale
+[[ "$locale" = 'en_US.UTF-8 UTF-8' ]] || printf '%s\n' 'en_US.UTF-8 UTF-8' >> /mnt/etc/locale.gen
+printf '%s\n' "$locale" >> /mnt/etc/locale.gen
+printf '%s\n' "LANG=${locale%% *}" > /mnt/etc/locale.conf
+arch-chroot /mnt locale-gen
+
+# console font and keymap
+cat << EOF > /mnt/etc/vconsole.conf
+KEYMAP=${keymap}
+FONT=${font}
+EOF
+
+# timezone
+ln -s /usr/share/zoneinfo/"$timezone" /mnt/etc/localtime
+
+# hardware clock
+hwclock --adjfile=/mnt/etc/adjtime -w --"$hardware_clock"
+
+# kernel modules
+if [[ "$configure_modules" = 'yes' ]]; then
+	for m in ${k_modules[@]}; do
+		printf '%s\n' "$m" >> /mnt/etc/modules-load.d/modules.conf
+	done
+fi
+
+# hostname
+printf '%s\n' "$hostname" > /mnt/etc/hostname
+sed -i '/^127.0.0.1/ s/$/\t'"$hostname"'/' /mnt/etc/hosts
+
+# network service
+if [[ "$network" != 'no' ]]; then
+	## fix wired network interface name to eth0
+	touch /mnt/etc/udev/rules.d/80-net-setup-link.rules
+	case "$network" in
+		dhcpcd)	systemctl -q --root=/mnt enable dhcpcd@eth0.service;;
+		ifplugd)
+			pacman_install ifplugd
+			systemctl -q --root=/mnt enable netctl-ifplugd@eth0.service;;
+		netctl)	cp ./"$netctl_profile" /mnt/etc/netctl
+			arch-chroot /mnt netctl enable "$netctl_profile";;
+	esac
+fi
+
+#  mkinitcpio
+if [[ "$configure_hooks" = 'yes' || "$edit_conf" = 'yes' ]]; then
+	cp /mnt/etc/mkinitcpio.conf /tmp/mkinitcpio.conf
+	if [[ "$configure_hooks" = 'yes' ]]; then
+		sed -i '/^HOOKS="/ c \HOOKS="'"$hooks"'"' /mnt/etc/mkinitcpio.conf
+	fi
+	if [[ "$edit_conf" = 'yes' ]]; then
+		"$EDITOR" /mnt/etc/mkinitcpio.conf
+		clear
+	fi
+	## only regenerate if modified
+	cmp -s /mnt/etc/mkinitcpio.conf /tmp/mkinitcpio.conf || arch-chroot /mnt mkinitcpio -p linux
+	rm -f /tmp/mkinitpcio.conf
+fi
+
+# root password
+if [[ "$set_password" = 'yes' ]]; then
+	if [[ "$ask_root_password" = 'yes' ]]; then
+		message 'Setting password for root user..'
+		## loop if entered passwords do not match
+		while :; do
+			if passwd -R /mnt root; then
+				break
+			else
+				(( "$?" == 10 )) || break
+			fi
+		done
+	else
+		printf '%s\n' "root:${root_password}" | chpasswd -R /mnt
+	fi
+fi
+
+# add user
+if [[ "$add_user" = 'yes' ]]; then
+	useradd -R /mnt -m -g users -s /bin/bash "$username"
+	## set user password
+	if [[ "$set_password" = 'yes' ]]; then
+		if [[ "$ask_user_password" = 'yes' ]]; then
+			message "Setting password for ${username}.."
+			while :; do
+				if passwd -R /mnt "$username"; then
+					break
+				else
+					(( "$?" == 10 )) || break
+				fi
+			done
+		else
+			printf '%s\n' "${username}:${user_password}" | chpasswd -R /mnt
+		fi
+	fi
+fi
+}
+
+install_bootloader() {
+message 'Installing bootloader..'
+if [[ "$uefi" = 'yes' ]]; then
+	# UEFI
+	if [[ "$bootloader" = 'grub' ]]; then
+		## install grub package
+		pacman_install dosfstools efibootmgr grub
+
+		## configure grub
+		if [[ "$manual_part" = 'yes' ]]; then
+			sed -i '/^GRUB_CMDLINE_LINUX_DEFAULT="/ s/quiet/'"$cmdline"'/' \
+/mnt/etc/default/grub
+		fi
+		if [[ "$edit_conf" = 'yes' ]]; then
+			"$EDITOR" /mnt/etc/default/grub
+			clear
+		fi
+
+		## run grub-mkconfig and grub-install
+		printf '%s\n' 'grub-mkconfig -o /boot/grub/grub.cfg; grub-install \
+--target=x86_64-efi --efi-directory=/boot --bootloader-id=arch_grub --recheck' | arch-chroot /mnt
+	else
+		## install gummiboot package
+		pacman_install gummiboot
+		## run gummiboot install
+		arch-chroot /mnt gummiboot install
+
+		## configure gummiboot
+		cat << EOF > /mnt/boot/loader/loader.conf
+default arch
+timeout 5
+EOF
+		if [[ "$manual_part" = 'no' ]]; then
+			local root_partuuid=$(lsblk -dno PARTUUID "$dest_disk""$root_num")
+			local cmdline="root=PARTUUID=${root_partuuid} rw"
+		fi
+		cat << EOF > /mnt/boot/loader/entries/arch.conf
+title	Arch Linux
+linux	/vmlinuz-linux
+initrd	/initramfs-linux.img
+options	${cmdline}
+EOF
+		if [[ "$edit_conf" = 'yes' ]]; then
+			"$EDITOR" /mnt/boot/loader/entries/arch.conf
+			clear
+		fi
+	fi
+else
+	# BIOS
+	if [[ "$bootloader" = 'syslinux' ]]; then
+		## install syslinux package
+		pacman_install gptfdisk syslinux
+
+		## run syslinux-install_update
+		arch-chroot /mnt syslinux-install_update -i -a -m
+
+		## configure syslinux
+		if [[ "$manual_part" = 'no' ]]; then
+			local root_partuuid=$(lsblk -dno PARTUUID "$dest_disk""$root_num")
+			local cmdline="root=PARTUUID=${root_partuuid} rw"
+		fi
+		cat << EOF > /mnt/boot/syslinux/syslinux.cfg
+PROMPT 1
+TIMEOUT 50
+DEFAULT arch
+
+LABEL arch
+	LINUX ../vmlinuz-linux
+	APPEND ${cmdline}
+	INITRD ../initramfs-linux.img
+
+LABEL archfallback
+	LINUX ../vmlinuz-linux
+	APPEND ${cmdline}
+	INITRD ../initramfs-linux-fallback.img
+EOF
+		if [[ "$edit_conf" = 'yes' ]]; then
+			"$EDITOR" /mnt/boot/syslinux/syslinux.cfg
+			clear
+		fi
+	else
+		## install grub package
+		pacman_install grub
+
+		## configure grub
+		if [[ "$manual_part" = 'yes' ]]; then
+			sed -i '/^GRUB_CMDLINE_LINUX_DEFAULT="/ s/quiet/'"$cmdline"'/' \
+/mnt/etc/default/grub
+		fi
+		if [[ "$edit_conf" = 'yes' ]]; then
+			"$EDITOR" /mnt/etc/default/grub
+			clear
+		fi
+
+		## run grub-mkconfig and grub-install
+		printf '%s\n' "grub-mkconfig -o /boot/grub/grub.cfg; grub-install \
+--target=i386-pc --recheck ${dest_disk}" | arch-chroot /mnt
+	fi
+fi
+}
+# }}}
+
+# parse commandline
+# {{{
+if (( "$#" > 0 )); then
+	(( "$#" > 1 )) && fail 'too many arguments'
+	if [[ "$1" = '-v' || "$1" = '--version' ]]; then
+		cat << EOF
+archinstaller ${VERSION}
+Copyright (C) 2014 Dennis Anfossi, Lukas B.
+License GPLv2
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.
+Written by Dennis Anfossi & Lukas B.
+EOF
+		exit 0
+	elif [[ "$1" = '-h' || "$1" = '--help' ]]; then
+		cat << EOF
+Run without arguments to start the installer.
+  -h  --help        display this help and exit
+  -v  --version     output version information and exit
+For the complete documentation see README.
+EOF
+		exit 0
+	else
+		fail "invalid option ${1}"
+	fi
+fi
+# }}}
+
+# test requirements
+# {{{
+# check root user id
+[[ "$EUID" = '0' ]] || fail 'please run as root user'
+
+# check arch linux
+[[ -e /etc/arch-release ]] || fail 'please run on arch linux'
+
+# arch-install-scripts required
+type pacstrap > /dev/null || fail 'missing package: arch-install-scripts'
+# gdisk required
+type gdisk > /dev/null || fail 'missing package: gptfdisk'
+# }}}
+
+# set defaults
+# {{{
+confirm='yes'
+edit_conf='yes'
+unmount='yes'
+manual_part='no'
+esp_size='512M'
+boot_size='128M'
+cryptsetup_options='-qy -c aes-xts-plain64 -h sha1 -s 256'
+
+# EDITOR defaults to nano if environment variable EDITOR is unset
+[[ -z "$EDITOR" ]] && EDITOR='nano'
+# }}}
+
+# check if configuration file is in the current working directory
+[[ -s ./ari.conf ]] || fail "configuration file ari.conf not found in $(pwd)"
+
+printf "$RED"
+cat << EOF
+---------------------------------------
+          archinstaller ${VERSION}
+---------------------------------------
+EOF
+printf "$ALL_OFF"
+
+# source configuration file
+source ./ari.conf
+
+# check configuration
+check_conf
+
+# load package list from file pkglist.txt
+[[ -s ./pkglist.txt ]] && packages+=( $( < ./pkglist.txt ) )
+
+# avoid errors due to "set -u" and unset variable
+## packages
+[[ -z "$packages" ]] && install_packages='no' || install_packages='yes'
+## kernel modules
+[[ -z "$k_modules" ]] && configure_modules='no' || configure_modules='yes'
+
+# check internet connection
+printf "$RED"
+printf '%s\n' '| Checking internet connection..'
+curl -f --retry 3 -m 10 -o /dev/null -s http://mirrors.kernel.org ||
+ fail 'please check the internet connection'
+printf "$GREEN"
+printf '%s\n' '| OK.'
+printf "$ALL_OFF"
+
+# check mirror status
+if [[ "$mirror" != 'keep' ]]; then
+	curl -f --retry 3 -m 10 -o /dev/null -s "$mirror"lastsync ||
+ fail 'please check the mirror status and configuration'
+fi
+
+# paranoid shell
+set -e -u
+
+# ask for confirmation
+[[ "$confirm" = 'yes' ]] && ask_confirm
+# create partitions & filesystems, mount filesystems
+[[ "$manual_part" = 'no' ]] && make_part
+
+# mirror
+if [[ "$mirror" != 'keep' ]]; then
+	mirror='Server = '"$mirror"'$repo/os/$arch'
+	printf '%s\n' "$mirror" > /etc/pacman.d/mirrorlist
+fi
+
+# pacstrap base packages
+message 'Installing base system..'
+pacstrap /mnt base
+
+# install xorg packages
+[[ "$xorg" = 'yes' ]] && install_xorg
+
+# install additional packages
+if [[ "$install_packages" = 'yes' ]]; then
+	message 'Installing additional packages..'
+	pacman_install ${packages[@]} || :
+fi
+
+# configure system
+configure_system
+
+# install bootloader
+install_bootloader
+
+# unmount filesystems
+if [[ "$unmount" = 'yes' ]]; then
+	message 'Unmounting filesystems..'
+	umount -R /mnt
+	## close encrypted volume
+	[[ "$manual_part" = 'no' && "$home" = 'yes' && "$encrypt_home" = 'yes' ]] &&
+	 cryptsetup close home
+else
+	message 'Please unmount the targeted filesystems before rebooting.'
+fi
+
+# finish
+printf "$RED"
+cat << EOF
+---------------------------------------
+        Installation completed!
+     Reboot the computer: # reboot
+---------------------------------------
+EOF
+printf "$ALL_OFF"
+
+exit 0
